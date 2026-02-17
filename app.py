@@ -376,13 +376,27 @@ def update_comparison_graph(window):
 
         tiempo_total = df["tiempo_s"].max()
 
-        resultados.append((nombre, df, tiempo_total))
+        T_amb = df["temperatura_C"].iloc[-1]  # asumimos última como ambiente
+
+        # Evitar log de cero o negativo
+        df_newton = df[df["temperatura_C"] > T_amb].copy()
+
+        df_newton["log_term"] = np.log(df_newton["temperatura_C"] - T_amb)
+
+        # Ajuste lineal
+        coef = np.polyfit(df_newton["tiempo_s"], df_newton["log_term"], 1)
+
+        k = -coef[0]  # pendiente negativa
+
+        tiempo_total = df["tiempo_s"].max()
+
+        resultados.append((nombre, df, tiempo_total, k))
 
     resultados.sort(key=lambda x: x[2], reverse=True)
 
     fig = go.Figure()
 
-    for nombre, df, tiempo_total in resultados:
+    for nombre, df, tiempo_total, k in resultados:
 
         label = nombre.split("_")[-1].replace(".csv", "")
 
@@ -390,7 +404,7 @@ def update_comparison_graph(window):
             x=df["tiempo_s"],
             y=df["MA"],
             mode="lines",
-            name=f"{label} ({tiempo_total/60:.1f} min)",
+            name=f"{label} | ({tiempo_total/60:.1f} min) | k={k:.4f} s⁻¹",
             line=dict(width=3)
         ))
 
