@@ -5,6 +5,9 @@ import plotly.graph_objs as go
 import pandas as pd
 import numpy as np
 import os
+import io
+import base64
+import re
 
 # =========================
 # CONFIGURACIÓN GENERAL
@@ -32,6 +35,7 @@ comparison_files = [
     "temperatura_celular_10-02-2026_19:29:46_hielos.csv",
     "temperatura_celular_10-02-2026_20:15:17_sin_apps.csv"
 ]
+DEFAULT_T_AMB = 24.5
 
 # =========================
 # CARGA DE DATOS
@@ -52,6 +56,58 @@ time_max = float(df_main["tiempo_s"].max())
 
 def clamp(value, low, high):
     return max(low, min(value, high))
+
+
+def normalize_ambient_temp(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_T_AMB
+
+
+def extract_horizontal_line_y(relayout_data):
+    if not isinstance(relayout_data, dict):
+        return None
+
+    y0_by_idx = {}
+    y1_by_idx = {}
+
+    for key, value in relayout_data.items():
+        m0 = re.match(r"shapes\[(\d+)\]\.y0$", key)
+        if m0:
+            y0_by_idx[int(m0.group(1))] = float(value)
+            continue
+        m1 = re.match(r"shapes\[(\d+)\]\.y1$", key)
+        if m1:
+            y1_by_idx[int(m1.group(1))] = float(value)
+
+    candidate_indices = sorted(set(y0_by_idx.keys()) | set(y1_by_idx.keys()), reverse=True)
+    for idx in candidate_indices:
+        y0 = y0_by_idx.get(idx)
+        y1 = y1_by_idx.get(idx)
+        if y0 is not None and (y1 is None or abs(y0 - y1) < 1e-9):
+            return y0
+        if y1 is not None and y0 is None:
+            return y1
+
+    shapes = relayout_data.get("shapes")
+    if isinstance(shapes, list):
+        for shape in reversed(shapes):
+            if not isinstance(shape, dict):
+                continue
+            y0 = shape.get("y0")
+            y1 = shape.get("y1")
+            if y0 is None or y1 is None:
+                continue
+            try:
+                y0 = float(y0)
+                y1 = float(y1)
+            except (TypeError, ValueError):
+                continue
+            if abs(y0 - y1) < 1e-9:
+                return y0
+
+    return None
 
 
 default_switch = clamp(float(max_temp_time), time_min, time_max)
@@ -100,6 +156,53 @@ def extract_phase_points_from_relayout(relayout_data, current_points):
 
     return list(normalize_phase_points(points))
 
+
+def parse_uploaded_csv(contents):
+    try:
+        _, encoded = contents.split(",", 1)
+        decoded = base64.b64decode(encoded).decode("utf-8")
+        df = pd.read_csv(io.StringIO(decoded))
+        if not {"tiempo_s", "temperatura_C"}.issubset(df.columns):
+            return None
+        df = df[["tiempo_s", "temperatura_C"]].copy()
+        df["tiempo_s"] = pd.to_numeric(df["tiempo_s"], errors="coerce")
+        df["temperatura_C"] = pd.to_numeric(df["temperatura_C"], errors="coerce")
+        df = df.dropna().sort_values("tiempo_s").reset_index(drop=True)
+        if len(df) < 2:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def get_main_df(uploaded_main_store):
+    if isinstance(uploaded_main_store, dict) and {"tiempo_s", "temperatura_C"}.issubset(uploaded_main_store.keys()):
+        df = pd.DataFrame(uploaded_main_store)
+        df["tiempo_s"] = pd.to_numeric(df["tiempo_s"], errors="coerce")
+        df["temperatura_C"] = pd.to_numeric(df["temperatura_C"], errors="coerce")
+        df = df.dropna().sort_values("tiempo_s").reset_index(drop=True)
+        if len(df) >= 2:
+            return df
+    return df_main.copy()
+
+
+def normalize_phase_points_for_df(phase_points, df):
+    local_min = float(df["tiempo_s"].min())
+    local_max = float(df["tiempo_s"].max())
+    peak_time = float(df.loc[df["temperatura_C"].idxmax(), "tiempo_s"])
+    default_local_switch = clamp(peak_time, local_min, local_max)
+    default_local_start = clamp(default_local_switch - 360, local_min, default_local_switch)
+    default_local_end = clamp(default_local_switch + 360, default_local_switch, local_max)
+
+    if not isinstance(phase_points, (list, tuple)) or len(phase_points) < 3:
+        return default_local_start, default_local_switch, default_local_end
+
+    points = sorted(float(x) for x in phase_points[:3])
+    start_heat = clamp(points[0], local_min, local_max)
+    switch_point = clamp(points[1], start_heat, local_max)
+    end_cool = clamp(points[2], switch_point, local_max)
+    return start_heat, switch_point, end_cool
+
 # =========================
 # APP
 # =========================
@@ -119,6 +222,31 @@ app.layout = html.Div(
             html.P("Experimental Thermal Run: Natural Cooling vs Other Methods",
                    style={"color": COLORS["text_secondary"]})
         ]),
+        html.Div(
+            [
+                html.Label("Temperatura ambiente (°C)", style={"color": COLORS["text_secondary"]}),
+                dcc.Input(
+                    id="ambient-temp",
+                    type="number",
+                    value=DEFAULT_T_AMB,
+                    step=0.1,
+                    style={
+                        "backgroundColor": COLORS["bg"],
+                        "color": COLORS["text_main"],
+                        "border": f"1px solid {COLORS['grid']}",
+                        "borderRadius": "8px",
+                        "padding": "8px 10px",
+                        "width": "150px"
+                    }
+                ),
+            ],
+            style={
+                "display": "flex",
+                "gap": "10px",
+                "alignItems": "center",
+                "marginTop": "10px"
+            }
+        ),
 
         html.Br(),
 
@@ -144,6 +272,8 @@ app.layout = html.Div(
         html.Div(id="tab-content"),
         dcc.Store(id="phase-points-store", data=[default_start, default_switch, default_end]),
         dcc.Store(id="comparison-anchor-store", data={}),
+        dcc.Store(id="uploaded-main-store", data=None),
+        dcc.Store(id="ambient-temp-store", data=DEFAULT_T_AMB),
     ]
 )
 
@@ -185,6 +315,27 @@ def render_tab(tab):
                             "color": COLORS["text_main"]},
                         className="dark-dropdown"
                     ),
+                    html.Br(),
+                    dcc.Upload(
+                        id="upload-main-data",
+                        children=html.Button(
+                            "Upload CSV (Tab 1)",
+                            style={
+                                "backgroundColor": COLORS["bg"],
+                                "color": COLORS["text_main"],
+                                "border": f"1px solid {COLORS['grid']}",
+                                "borderRadius": "8px",
+                                "padding": "10px 14px",
+                                "cursor": "pointer",
+                                "height": "40px"
+                            }
+                        ),
+                        multiple=False
+                    ),
+                    html.P(
+                        "Formato: columnas tiempo_s y temperatura_C",
+                        style={"color": COLORS["text_secondary"], "marginTop": "8px"}
+                    ),
 
                 ],
                 style={
@@ -200,8 +351,20 @@ def render_tab(tab):
                         id="main-graph",
                         config={"edits": {"shapePosition": True}}
                     ),
+                    dcc.Graph(id="comparison-graph", style={"display": "none"}),
+                    dcc.Dropdown(
+                        id="ma-window-compare",
+                        options=[{"label": str(x), "value": x} for x in [20,30,45,60, 120, 300]],
+                        value=20,
+                        style={"display": "none"}
+                    ),
+                    html.Button(
+                        id="reset-comparison-anchors",
+                        n_clicks=0,
+                        style={"display": "none"}
+                    ),
                     html.P(
-                        "Drag vertical lines directly on the chart: Start | Switch | End.",
+                        "Drag vertical lines directly on the chart: Start heating | Switch | End cooling.",
                         style={"color": COLORS["text_secondary"], "marginTop": "6px"}
                     )
                 ],
@@ -224,7 +387,7 @@ def render_tab(tab):
                         html.Label("Window (s)", style={"color": COLORS["text_secondary"]}),
                         dcc.Dropdown(
                             id="ma-window-compare",
-                            options=[{"label": str(x), "value": x} for x in [20,30,45,60, 120, 300]],
+                            options=[{"label": str(x), "value": x} for x in [2,10,20,30,45,60, 120, 300]],
                             value=20,
                             style={"backgroundColor": COLORS["bg"], "color": COLORS["text_main"]},
                             className="dark-dropdown"
@@ -267,44 +430,116 @@ def render_tab(tab):
 
             html.Br(),
 
-            dcc.Graph(id="comparison-graph"),
-            dcc.Graph(id="main-graph", style={"display": "none"})
+            dcc.Graph(id="comparison-graph", config={"edits": {"shapePosition": True}}),
+            dcc.Graph(id="main-graph", style={"display": "none"}),
+            dcc.Upload(id="upload-main-data", style={"display": "none"})
 
         ])
+
+
+@app.callback(
+    Output("ambient-temp-store", "data"),
+    Input("ambient-temp", "value"),
+    Input("main-graph", "relayoutData"),
+    Input("comparison-graph", "relayoutData"),
+    State("ambient-temp-store", "data"),
+    prevent_initial_call=True
+)
+def sync_ambient_temp(ambient_temp_input, main_relayout, comparison_relayout, current_ambient):
+    trigger = dash.ctx.triggered_id
+    current_ambient = normalize_ambient_temp(current_ambient)
+
+    if trigger == "ambient-temp":
+        new_ambient = normalize_ambient_temp(ambient_temp_input)
+        if abs(new_ambient - current_ambient) < 1e-9:
+            raise PreventUpdate
+        return new_ambient
+
+    if trigger == "main-graph":
+        y = extract_horizontal_line_y(main_relayout)
+    elif trigger == "comparison-graph":
+        y = extract_horizontal_line_y(comparison_relayout)
+    else:
+        raise PreventUpdate
+
+    if y is None:
+        raise PreventUpdate
+
+    new_ambient = normalize_ambient_temp(y)
+    if abs(new_ambient - current_ambient) < 1e-9:
+        raise PreventUpdate
+    return new_ambient
+
+
+@app.callback(
+    Output("ambient-temp", "value"),
+    Input("ambient-temp-store", "data")
+)
+def reflect_ambient_temp(ambient_temp_store):
+    return normalize_ambient_temp(ambient_temp_store)
 
 # =========================
 # TAB 1 CALLBACK
 # =========================
 
 @app.callback(
+    Output("uploaded-main-store", "data"),
+    Output("phase-points-store", "data", allow_duplicate=True),
+    Input("upload-main-data", "contents"),
+    prevent_initial_call=True
+)
+def update_uploaded_main_data(contents):
+    if not contents:
+        raise PreventUpdate
+
+    df = parse_uploaded_csv(contents)
+    if df is None:
+        raise PreventUpdate
+
+    start_heat, switch_point, end_cool = normalize_phase_points_for_df(None, df)
+    return (
+        {
+            "tiempo_s": df["tiempo_s"].tolist(),
+            "temperatura_C": df["temperatura_C"].tolist(),
+        },
+        [start_heat, switch_point, end_cool],
+    )
+
+@app.callback(
     Output("phase-points-store", "data"),
     Input("main-graph", "relayoutData"),
     Input("tabs", "value"),
     State("phase-points-store", "data"),
+    State("uploaded-main-store", "data"),
     prevent_initial_call=True
 )
-def update_phase_points_from_graph(relayout_data, tab, phase_points_store):
+def update_phase_points_from_graph(relayout_data, tab, phase_points_store, uploaded_main_store):
     if tab != "tab1" or not isinstance(relayout_data, dict):
         raise PreventUpdate
 
+    df = get_main_df(uploaded_main_store)
+    current_points = normalize_phase_points_for_df(phase_points_store, df)
     updated = extract_phase_points_from_relayout(
         relayout_data,
-        phase_points_store,
+        current_points,
     )
     if updated is None:
         raise PreventUpdate
-    return updated
+    return list(normalize_phase_points_for_df(updated, df))
 
 
 @app.callback(
     Output("main-graph", "figure"),
     Input("window", "value"),
-    Input("phase-points-store", "data")
+    Input("phase-points-store", "data"),
+    Input("uploaded-main-store", "data"),
+    Input("ambient-temp-store", "data")
 )
-def update_main_graph(window, phase_points_store):
-    start_heat, switch_point, end_cool = normalize_phase_points(phase_points_store)
+def update_main_graph(window, phase_points_store, uploaded_main_store, ambient_temp_store):
+    T_AMB = normalize_ambient_temp(ambient_temp_store)
+    df = get_main_df(uploaded_main_store)
+    start_heat, switch_point, end_cool = normalize_phase_points_for_df(phase_points_store, df)
 
-    df = df_main.copy()
     df["MA"] = df["temperatura_C"].rolling(window=window).mean()
 
     Tmax = df["temperatura_C"].max()
@@ -389,6 +624,15 @@ def update_main_graph(window, phase_points_store):
         arrowcolor=COLORS["text_secondary"],
         font=dict(color=COLORS["text_secondary"])
     )
+    fig.add_hline(
+        y=T_AMB,
+        line_dash="dash",
+        line_width=2,
+        line_color=COLORS["text_secondary"],
+        annotation_text=f"Temperatura ambiente ({T_AMB:.1f}°C)",
+        annotation_position="top right",
+        editable=True,
+    )
 
     fig.update_layout(
         plot_bgcolor=COLORS["bg"],
@@ -415,19 +659,22 @@ def update_main_graph(window, phase_points_store):
 @app.callback(
     Output("kpi-cards", "children"),
     Input("window", "value"),
-    Input("phase-points-store", "data")
+    Input("phase-points-store", "data"),
+    Input("uploaded-main-store", "data"),
+    Input("ambient-temp-store", "data")
 )
-def update_kpis(window, phase_points_store):
-    start_heat, switch_point, end_cool = normalize_phase_points(phase_points_store)
+def update_kpis(window, phase_points_store, uploaded_main_store, ambient_temp_store):
+    T_AMB_KPI = normalize_ambient_temp(ambient_temp_store)
+    df = get_main_df(uploaded_main_store)
+    start_heat, switch_point, end_cool = normalize_phase_points_for_df(phase_points_store, df)
 
     heating_time = (switch_point - start_heat)/60
     cooling_time = (end_cool - switch_point)/60
-    Tmax = df_main["temperatura_C"].max()
-    T_AMB_KPI = 24.5
+    Tmax = df["temperatura_C"].max()
 
-    df_cooling = df_main[
-        (df_main["tiempo_s"] >= switch_point) &
-        (df_main["tiempo_s"] <= end_cool)
+    df_cooling = df[
+        (df["tiempo_s"] >= switch_point) &
+        (df["tiempo_s"] <= end_cool)
     ].copy()
 
     df_newton = df_cooling[df_cooling["temperatura_C"] > T_AMB_KPI].copy()
@@ -503,11 +750,12 @@ def update_comparison_anchors(click_data, reset_clicks, anchor_store):
 @app.callback(
     Output("comparison-graph", "figure"),
     Input("ma-window-compare", "value"),
-    Input("comparison-anchor-store", "data")
+    Input("comparison-anchor-store", "data"),
+    Input("ambient-temp-store", "data")
 )
-def update_comparison_graph(window, anchor_store):
+def update_comparison_graph(window, anchor_store, ambient_temp_store):
 
-    T_AMB = 24.5
+    T_AMB = normalize_ambient_temp(ambient_temp_store)
     anchor_store = anchor_store if isinstance(anchor_store, dict) else {}
     resultados = []
 
@@ -571,8 +819,9 @@ def update_comparison_graph(window, anchor_store):
         line_dash="dash",
         line_width=2,
         line_color=COLORS["text_secondary"],
-        annotation_text="Temperatura ambiente (24.5°C)",
+        annotation_text=f"Temperatura ambiente ({T_AMB:.1f}°C)",
         annotation_position="top right",
+        editable=True,
     )
 
     fig.update_layout(
@@ -599,4 +848,4 @@ def update_comparison_graph(window, anchor_store):
 # =========================
 
 if __name__ == "__main__":
-    app.run_server(debug=True)
+    app.run_server(debug=True, port=8051)
