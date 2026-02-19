@@ -319,7 +319,7 @@ def render_tab(tab):
                     dcc.Upload(
                         id="upload-main-data",
                         children=html.Button(
-                            "Upload CSV (Tab 1)",
+                            "Upload CSV",
                             style={
                                 "backgroundColor": COLORS["bg"],
                                 "color": COLORS["text_main"],
